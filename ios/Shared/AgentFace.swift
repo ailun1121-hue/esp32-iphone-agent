@@ -233,7 +233,10 @@ struct Spiral: Shape {
         for i in 0...60 {
             let a = Double(i) / 60 * 2.6 * 2 * .pi
             let rad = maxR * Double(i) / 60
-            let pt = CGPoint(x: c.x + rad * cos(a), y: c.y + rad * sin(a))
+            // `rad` is CGFloat and `a` is Double, so a bare `cos(a)` / `sin(a)` is ambiguous between
+            // the CoreGraphics and Foundation overloads and fails to compile in optimized builds.
+            let pt = CGPoint(x: c.x + CGFloat(rad * Double(cos(a))),
+                             y: c.y + CGFloat(rad * Double(sin(a))))
             if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
         }
         return p
