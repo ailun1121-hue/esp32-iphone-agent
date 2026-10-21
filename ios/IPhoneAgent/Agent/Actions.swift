@@ -130,6 +130,10 @@ func points(_ act: JObject) -> [CGPoint] {
 func circle(_ x: Double, _ y: Double, _ r: Double, aspect: Double, n: Int = 24) -> [CGPoint] {
     (0...n).map { i in
         let a = 2 * Double.pi * Double(i) / Double(n)
-        return CGPoint(x: x + r * cos(a), y: y + r * aspect * sin(a))
+        // Spell out the Double overloads: CGFloat/Double mixed arithmetic otherwise lets the
+        // compiler pick CoreGraphics' cos/sin and report an ambiguity in optimized builds.
+        let dx: Double = r * cos(a)
+        let dy: Double = r * aspect * sin(a)
+        return CGPoint(x: x + dx, y: y + dy)
     }
 }
