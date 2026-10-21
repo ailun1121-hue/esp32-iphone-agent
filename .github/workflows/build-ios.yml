@@ -22,6 +22,13 @@ on:
         default: Release
   push:
     tags: ['ios-v*']
+    # Also build on pushes that touch the app or this workflow, so no manual dispatch (and no
+    # Actions:write token scope) is needed to get an .ipa. Paths keep unrelated commits quiet.
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - 'prompts/**'
+      - '.github/workflows/build-ios.yml'
 
 jobs:
   build:
