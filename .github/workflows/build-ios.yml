@@ -1,0 +1,198 @@
+name: Build iOS IPA
+
+# Cloud-build an ad-hoc/unsigned .ipa on GitHub's macOS runners, so contributors without a Mac can
+# still get a binary for Sideloadly/AltStore. This is a build convenience, NOT a distribution path:
+# the resulting .ipa carries no App Store signature and requires re-signing on the user's machine
+# with their own Apple ID (free accounts expire after 7 days).
+#
+# Manual: Actions -> Build iOS IPA -> Run workflow.
+# Optional repository variables (Settings -> Variables):
+#   IA_BUNDLE_ID  your bundle identifier (default com.example.esp32agent)
+#   IA_SIGNED     'true' to build signed with a team + provisioning profile from secrets
+# Secrets (only when IA_SIGNED=true):
+#   DEVELOPMENT_TEAM, P12_BASE64, P12_PASSWORD, PROVISIONING_PROFILE_BASE64
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        type: choice
+        options: [Release, Debug]
+        default: Release
+  push:
+    tags: ['ios-v*']
+
+jobs:
+  build:
+    # macos-15 defaults to Xcode 16.4 and ships the iOS 18.x SDKs the project's iOS 18.0 deployment
+    # target requires. macos-14 would work only with an explicit xcode-select: its DEFAULT Xcode is
+    # 15.4 (iOS 17.5 SDK), which cannot build an iOS 18 target at all. macos-13 has no 18 SDK either.
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios
+    env:
+      IA_BUNDLE_ID: ${{ vars.IA_BUNDLE_ID || 'com.example.esp32agent' }}
+      CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # macos-15 already defaults to a 16.x toolchain, so normally nothing to switch. If the image
+      # later moves its default to an older Xcode, pick a 16.x one explicitly rather than failing with
+      # a cryptic "unsupported deployment target" error.
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if ! xcodebuild -version | head -1 | grep -qE 'Xcode (1[6-9]|2[0-9])'; then
+            for candidate in /Applications/Xcode_16.4.app /Applications/Xcode_16.3.app \
+                             /Applications/Xcode_16.2.app /Applications/Xcode_16.1.app; do
+              if [ -d "$candidate" ]; then
+                sudo xcode-select -switch "$candidate"
+                echo "switched to $candidate"
+                break
+              fi
+            done
+          fi
+
+      - name: Check toolchain
+        run: |
+          xcodebuild -version
+          sdk=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK: $sdk"
+          # Fail fast with a clear message instead of a confusing deployment-target error later.
+          case "$sdk" in
+            1[89].*|2[0-9].*) ;;
+            *) echo "::error::iOS SDK $sdk is older than the project's iOS 18.0 deployment target"; exit 1 ;;
+          esac
+
+      # The app uses the entitlements (Hotspot Configuration, App Group) only when a developer team
+      # is available. For a plain unsigned build they must stay empty, otherwise codesign fails.
+      - name: Write Local.xcconfig
+        run: |
+          {
+            echo "IA_BUNDLE_ID = ${IA_BUNDLE_ID}"
+            echo "IA_ENTITLEMENTS ="
+            echo "IA_WIDGET_ENTITLEMENTS ="
+          } > Config/Local.xcconfig
+          cat Config/Local.xcconfig
+
+      - name: Is a signed build requested?
+        id: signed
+        env:
+          IA_SIGNED: ${{ vars.IA_SIGNED }}
+        run: |
+          if [ "${IA_SIGNED}" = "true" ]; then echo "value=yes" >> "$GITHUB_OUTPUT"
+          else echo "value=no" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Import signing certificate
+        if: steps.signed.outputs.value == 'yes'
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          TEAM_ID: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.PROVISIONING_PROFILE_BASE64 }}" | base64 --decode \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          echo "TEAM_ID=${TEAM_ID}" >> "$GITHUB_ENV"
+
+      - name: Archive (unsigned)
+        if: steps.signed.outputs.value == 'no'
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project IPhoneAgent.xcodeproj \
+            -scheme IPhoneAgent \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/IPhoneAgent.xcarchive \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            IA_BUNDLE_ID="${IA_BUNDLE_ID}"
+
+      - name: Archive (signed)
+        if: steps.signed.outputs.value == 'yes'
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project IPhoneAgent.xcodeproj \
+            -scheme IPhoneAgent \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/IPhoneAgent.xcarchive \
+            -derivedDataPath build/DerivedData \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            -allowProvisioningUpdates \
+            IA_BUNDLE_ID="${IA_BUNDLE_ID}"
+
+      # For the unsigned case xcodebuild exports no .ipa at all, so pack Payload/ by hand. Sideloadly
+      # and AltStore both accept this layout and re-sign on import.
+      - name: Package .ipa
+        run: |
+          set -euo pipefail
+          app="build/IPhoneAgent.xcarchive/Products/Applications/IPhoneAgent.app"
+          test -d "$app"
+          mkdir -p build/Payload
+          cp -R "$app" build/Payload/
+
+          # Free-Apple-ID signing (Sideloadly/AltStore) must re-sign every nested bundle. The Live
+          # Activity widget (.appex) is an app extension with its own identity and its own App Group
+          # entitlement, which a free profile cannot issue -- re-signing then fails with
+          # "the executable was signed with invalid entitlements". Drop it from the unsigned .ipa:
+          # the Agent itself works without it, only the Dynamic Island progress disappears.
+          if [ "${{ steps.signed.outputs.value }}" = "no" ]; then
+            if [ -d "build/Payload/IPhoneAgent.app/PlugIns" ]; then
+              echo "removing app extensions for free-signing compatibility:"
+              ls "build/Payload/IPhoneAgent.app/PlugIns"
+              rm -rf "build/Payload/IPhoneAgent.app/PlugIns"
+            fi
+            # Same reasoning for an embedded embedded.mobileprovision (stale from a previous run).
+            rm -f "build/Payload/IPhoneAgent.app/embedded.mobileprovision"
+          fi
+
+          (cd build && /usr/bin/zip -qry IPhoneAgent.ipa Payload)
+          ls -lh build/IPhoneAgent.ipa
+
+      - name: Sanity-check the .ipa
+        run: |
+          set -euo pipefail
+          unzip -l build/IPhoneAgent.ipa | head -20
+          # The bundle ID baked into Info.plist must match what we asked for.
+          unzip -p build/IPhoneAgent.ipa 'Payload/*.app/Info.plist' > /tmp/Info.plist
+          plutil -p /tmp/Info.plist | grep -E 'CFBundleIdentifier|MinimumOSVersion|CFBundleShortVersionString'
+          # Guard the free-signing invariant: no un-signable nested bundle may remain.
+          if [ "${{ steps.signed.outputs.value }}" = "no" ]; then
+            if unzip -l build/IPhoneAgent.ipa | grep -q '\.appex/'; then
+              echo "::error::an .appex slipped into the unsigned .ipa; free-ID re-signing will fail"; exit 1
+            fi
+            echo "no app extensions: compatible with free-ID re-signing"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPhoneAgent-${{ inputs.configuration || 'Release' }}-ipa
+          path: ios/build/IPhoneAgent.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      # Keep the archive around: its dSYMs are what you need to symbolicate a crash from the device.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IPhoneAgent-xcarchive
+          path: ios/build/IPhoneAgent.xcarchive
+          if-no-files-found: error
+          retention-days: 7
