@@ -134,7 +134,7 @@ private struct Ripple: View {
                 Circle().stroke(Color.white, lineWidth: 7).frame(width: 30, height: 30)
                 Circle().stroke(ink, lineWidth: 4).frame(width: 30, height: 30)
                 Circle().fill(ink).frame(width: 8, height: 8)
-                Hand(press: reduceMotion ? 0 : CGFloat(max(0, sin(time * 2 * .pi / 1.2))))
+                Hand(press: reduceMotion ? 0 : CGFloat(max(0, sin(Double(time) * 2 * Double.pi / 1.2))))
                     .offset(x: 4, y: 26)
                     .opacity(min(1, 2 * t))
             }
@@ -179,7 +179,10 @@ private struct Trail: View {
                     Image(systemName: "arrowtriangle.up.fill")
                         .font(.system(size: 18))
                         .foregroundStyle(ink)
-                        .rotationEffect(.radians(atan2(last.y - prev.y, last.x - prev.x) + .pi / 2))
+                        // points are CGPoints, so the deltas and atan2 result are CGFloat. Convert
+                        // before adding .pi: a CGFloat + Double-literal mix is ambiguous in optimized
+                        // builds ("ambiguous use of 'pi'").
+                        .rotationEffect(.radians(Double(atan2(last.y - prev.y, last.x - prev.x)) + Double.pi / 2))
                         .position(last)
                         .opacity(Double(t))
                     Hand()
